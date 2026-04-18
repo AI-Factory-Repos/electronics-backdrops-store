@@ -1,148 +1,232 @@
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
 const Cart = require('../models/Cart');
 const Product = require('../models/Product');
 const ProductVariant = require('../models/ProductVariant');
-const { optionalAuth } = require('../middleware/auth');
+const authMiddleware = require('../middleware/auth');
 
-const getCart = async (userId, guestSessionId) => {
-  if (userId) return Cart.findOne({ userId });
-  if (guestSessionId) return Cart.findOne({ guestSessionId });
+// Helper: resolve cart filter from request (auth user or guest session)
+function getCartFilter(req) {
+  if (req.user && req.user.id) {
+    return { userId: req.user.id };
+  }
+  const guestSessionId = req.headers['x-guest-session-id'] || req.query.guestSessionId;
+  if (guestSessionId) {
+    return { guestSessionId };
+  }
   return null;
-};
+}
 
-const populateCart = async (cart) => {
-  if (!cart) return null;
-  await cart.populate([
-    { path: 'items.productId', select: 'name images price isActive' },
-    { path: 'items.variantId', select: 'size color stock priceModifier' }
-  ]);
-  return cart;
-};
+// Helper: populate cart items with product and variant details
+async function buildCartResponse(cart) {
+  const populatedItems = await Promise.all(
+    cart.items.map(async (item) => {
+      const product = await Product.findById(item.productId).select('name price images category').lean();
+      let variant = null;
+      if (item.variantId) {
+        variant = await ProductVariant.findById(item.variantId).select('size color techSpecs stock').lean();
+      }
+      const unitPrice = product ? product.price : 0;
+      return {
+        id: item._id,
+        productId: item.productId,
+        variantId: item.variantId,
+        quantity: item.quantity,
+        product: product || null,
+        variant: variant || null,
+        unitPrice,
+        subtotal: unitPrice * item.quantity
+      };
+    })
+  );
 
-const computeTotal = (items) => {
-  return items.reduce((sum, item) => {
-    const base = item.priceAtAdd || 0;
-    return sum + base * item.quantity;
-  }, 0);
-};
+  const total = populatedItems.reduce((sum, i) => sum + i.subtotal, 0);
+
+  return {
+    cart: {
+      id: cart._id,
+      userId: cart.userId,
+      guestSessionId: cart.guestSessionId
+    },
+    items: populatedItems,
+    total: Math.round(total * 100) / 100
+  };
+}
+
+// Optional auth — attaches user if token present but does not block guests
+function optionalAuth(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return next();
+  authMiddleware(req, res, next);
+}
 
 // GET /api/cart
 router.get('/', optionalAuth, async (req, res) => {
   try {
-    const userId = req.user ? req.user._id : null;
-    const guestSessionId = req.headers['x-guest-session-id'] || null;
+    const filter = getCartFilter(req);
+    if (!filter) {
+      return res.status(400).json({ error: 'No user session or guest session ID provided' });
+    }
 
-    let cart = await getCart(userId, guestSessionId);
-    if (!cart) return res.json({ cart: null, items: [], total: 0 });
+    let cart = await Cart.findOne(filter);
+    if (!cart) {
+      // Return empty cart
+      return res.json({ cart: { id: null, userId: filter.userId || null, guestSessionId: filter.guestSessionId || null }, items: [], total: 0 });
+    }
 
-    await populateCart(cart);
-    const total = computeTotal(cart.items);
-    res.json({ cart, items: cart.items, total });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    const response = await buildCartResponse(cart);
+    return res.json(response);
+  } catch (err) {
+    console.error('GET /api/cart error:', err);
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
 // POST /api/cart/items
 router.post('/items', optionalAuth, async (req, res) => {
   try {
-    const { productId, variantId, quantity = 1 } = req.body;
-    if (!productId) return res.status(400).json({ message: 'Product ID is required' });
+    const filter = getCartFilter(req);
+    if (!filter) {
+      return res.status(400).json({ error: 'No user session or guest session ID provided' });
+    }
 
+    const { productId, variantId, quantity } = req.body;
+
+    if (!productId) {
+      return res.status(400).json({ error: 'productId is required' });
+    }
+
+    const qty = parseInt(quantity, 10);
+    if (!qty || qty < 1) {
+      return res.status(400).json({ error: 'quantity must be a positive integer' });
+    }
+
+    // Validate product exists
     const product = await Product.findById(productId);
-    if (!product || !product.isActive) {
-      return res.status(404).json({ message: 'Product not found' });
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' });
     }
 
-    let priceAtAdd = product.price;
+    // Validate variant if provided
     if (variantId) {
-      const variant = await ProductVariant.findById(variantId);
-      if (!variant || !variant.isActive) {
-        return res.status(404).json({ message: 'Variant not found' });
+      const variant = await ProductVariant.findOne({ _id: variantId, productId });
+      if (!variant) {
+        return res.status(404).json({ error: 'Product variant not found' });
       }
-      if (variant.stock < quantity) {
-        return res.status(400).json({ message: 'Insufficient stock' });
+      if (variant.stock < qty) {
+        return res.status(400).json({ error: 'Insufficient stock for requested quantity' });
       }
-      priceAtAdd = product.price + (variant.priceModifier || 0);
     }
 
-    const userId = req.user ? req.user._id : null;
-    const guestSessionId = req.headers['x-guest-session-id'] || null;
-
-    if (!userId && !guestSessionId) {
-      return res.status(400).json({ message: 'User or guest session required' });
-    }
-
-    let cart = await getCart(userId, guestSessionId);
+    let cart = await Cart.findOne(filter);
     if (!cart) {
-      cart = new Cart({ userId, guestSessionId, items: [] });
+      cart = new Cart({
+        userId: filter.userId || null,
+        guestSessionId: filter.guestSessionId || null,
+        items: []
+      });
     }
 
-    const existingIdx = cart.items.findIndex(
-      (i) => i.productId.toString() === productId && (!variantId || (i.variantId && i.variantId.toString() === variantId))
+    // Check if same product+variant already in cart
+    const existingIndex = cart.items.findIndex(
+      (i) =>
+        i.productId.toString() === productId.toString() &&
+        (variantId ? i.variantId && i.variantId.toString() === variantId.toString() : !i.variantId)
     );
 
-    if (existingIdx > -1) {
-      cart.items[existingIdx].quantity += parseInt(quantity);
+    if (existingIndex > -1) {
+      cart.items[existingIndex].quantity += qty;
     } else {
-      cart.items.push({ productId, variantId: variantId || undefined, quantity: parseInt(quantity), priceAtAdd });
+      cart.items.push({
+        productId,
+        variantId: variantId || null,
+        quantity: qty
+      });
     }
 
     await cart.save();
-    await populateCart(cart);
-    const total = computeTotal(cart.items);
-    res.status(201).json({ cart, items: cart.items, total });
-  } catch (error) {
-    if (error.name === 'CastError') return res.status(400).json({ message: 'Invalid ID format' });
-    res.status(500).json({ message: 'Server error' });
+    const response = await buildCartResponse(cart);
+    return res.status(201).json(response);
+  } catch (err) {
+    console.error('POST /api/cart/items error:', err);
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
 // PUT /api/cart/items/:itemId
 router.put('/items/:itemId', optionalAuth, async (req, res) => {
   try {
-    const { quantity } = req.body;
-    if (!quantity || quantity < 1) {
-      return res.status(400).json({ message: 'Quantity must be at least 1' });
+    const filter = getCartFilter(req);
+    if (!filter) {
+      return res.status(400).json({ error: 'No user session or guest session ID provided' });
     }
 
-    const userId = req.user ? req.user._id : null;
-    const guestSessionId = req.headers['x-guest-session-id'] || null;
-    const cart = await getCart(userId, guestSessionId);
-    if (!cart) return res.status(404).json({ message: 'Cart not found' });
+    const { itemId } = req.params;
+    const { quantity } = req.body;
 
-    const item = cart.items.id(req.params.itemId);
-    if (!item) return res.status(404).json({ message: 'Cart item not found' });
+    const qty = parseInt(quantity, 10);
+    if (!qty || qty < 1) {
+      return res.status(400).json({ error: 'quantity must be a positive integer' });
+    }
 
-    item.quantity = parseInt(quantity);
+    const cart = await Cart.findOne(filter);
+    if (!cart) {
+      return res.status(404).json({ error: 'Cart not found' });
+    }
+
+    const item = cart.items.id(itemId);
+    if (!item) {
+      return res.status(404).json({ error: 'Cart item not found' });
+    }
+
+    // Validate stock if variant present
+    if (item.variantId) {
+      const variant = await ProductVariant.findById(item.variantId);
+      if (variant && variant.stock < qty) {
+        return res.status(400).json({ error: 'Insufficient stock for requested quantity' });
+      }
+    }
+
+    item.quantity = qty;
     await cart.save();
-    await populateCart(cart);
-    const total = computeTotal(cart.items);
-    res.json({ cart, items: cart.items, total });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+
+    const response = await buildCartResponse(cart);
+    return res.json(response);
+  } catch (err) {
+    console.error('PUT /api/cart/items/:itemId error:', err);
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
 // DELETE /api/cart/items/:itemId
 router.delete('/items/:itemId', optionalAuth, async (req, res) => {
   try {
-    const userId = req.user ? req.user._id : null;
-    const guestSessionId = req.headers['x-guest-session-id'] || null;
-    const cart = await getCart(userId, guestSessionId);
-    if (!cart) return res.status(404).json({ message: 'Cart not found' });
+    const filter = getCartFilter(req);
+    if (!filter) {
+      return res.status(400).json({ error: 'No user session or guest session ID provided' });
+    }
 
-    const item = cart.items.id(req.params.itemId);
-    if (!item) return res.status(404).json({ message: 'Cart item not found' });
+    const { itemId } = req.params;
+
+    const cart = await Cart.findOne(filter);
+    if (!cart) {
+      return res.status(404).json({ error: 'Cart not found' });
+    }
+
+    const item = cart.items.id(itemId);
+    if (!item) {
+      return res.status(404).json({ error: 'Cart item not found' });
+    }
 
     item.deleteOne();
     await cart.save();
-    await populateCart(cart);
-    const total = computeTotal(cart.items);
-    res.json({ cart, items: cart.items, total });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+
+    const response = await buildCartResponse(cart);
+    return res.json(response);
+  } catch (err) {
+    console.error('DELETE /api/cart/items/:itemId error:', err);
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
