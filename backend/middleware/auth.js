@@ -1,65 +1,33 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
 
-/**
- * Protect routes — requires a valid JWT.
- */
-const protect = async (req, res, next) => {
+const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
+
+function verifyToken(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  const token = authHeader.split(' ')[1];
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ message: 'No token provided. Authorization denied.' });
-    }
-
-    const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    const user = await User.findById(decoded.id).select('-password');
-    if (!user) {
-      return res.status(401).json({ message: 'Token is valid but user no longer exists.' });
-    }
-
-    req.user = user;
-    next();
-  } catch (err) {
-    if (err.name === 'JsonWebTokenError') {
-      return res.status(401).json({ message: 'Invalid token.' });
-    }
-    if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({ message: 'Token has expired.' });
-    }
-    return res.status(500).json({ message: 'Server error during authentication.' });
-  }
-};
-
-/**
- * Optional auth — attaches user if token present, but does not block guests.
- */
-const optionalAuth = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return next();
-    }
-    const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id).select('-password');
-    if (user) req.user = user;
-    next();
+    return jwt.verify(token, JWT_SECRET);
   } catch {
-    // Invalid/expired token — treat as guest
-    next();
+    return null;
   }
-};
+}
 
-/**
- * Admin-only guard — must be used after protect.
- */
-const adminOnly = (req, res, next) => {
-  if (!req.user || req.user.role !== 'admin') {
-    return res.status(403).json({ message: 'Access denied. Admins only.' });
+// Middleware: require valid JWT
+function required(req, res, next) {
+  const payload = verifyToken(req);
+  if (!payload) {
+    return res.status(401).json({ message: 'Authentication required' });
   }
+  req.user = payload;
   next();
-};
+}
 
-module.exports = { protect, optionalAuth, adminOnly };
+// Middleware: attach user if token present, but do not block
+function optional(req, res, next) {
+  const payload = verifyToken(req);
+  if (payload) req.user = payload;
+  next();
+}
+
+module.exports = { required, optional };
