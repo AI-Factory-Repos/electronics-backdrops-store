@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const path = require('path');
 const connectDB = require('./config/db');
 
 const authRoutes = require('./routes/auth');
@@ -15,11 +16,19 @@ const app = express();
 // Connect to MongoDB
 connectDB();
 
-// Middleware
+// ---------------------------------------------------------------------------
+// Stripe webhook must receive raw body — mount BEFORE express.json()
+// ---------------------------------------------------------------------------
+app.use('/api/payments/stripe/webhook', express.raw({ type: 'application/json' }));
+
+// Standard body parsing
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Routes
+// Static frontend
+app.use(express.static(path.join(__dirname, '..', 'frontend')));
+
+// API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/categories', categoryRoutes);
@@ -28,16 +37,9 @@ app.use('/api/orders', orderRoutes);
 app.use('/api/shipping', shippingRoutes);
 app.use('/api/payments', paymentRoutes);
 
-// Health check
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-// 404 handler
-app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
-
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: 'Internal server error' });
+// Fallback — serve frontend
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'frontend', 'pages', 'home.html'));
 });
 
 const PORT = process.env.PORT || 5000;
